@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 # DATOS (EJEMPLO)
 # ==============================
 x = np.array([2, 4, 6, 8, 10])
-y = np.array([50, 60, 70, 85, 95])
+y = np.array([45, 55, 70, 78, 88])
 n = len(x)
 
 print("\n")
