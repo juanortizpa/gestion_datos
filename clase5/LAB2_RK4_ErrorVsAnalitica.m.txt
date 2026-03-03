@@ -1,0 +1,601 @@
+%% LAB2_RK4_ErrorVsAnalitica.m  (SOLVED + COMENTARIOS EXTENDIDOS)
+% =========================================================================
+% Laboratorio 2 — Runge–Kutta de 4º orden (RK4 clásico, paso fijo)
+% Técnicas de Validación y Simulación — Universidad Cooperativa de Colombia
+%
+% ========================================================================
+% 1) ¿QUÉ HACE ESTE SCRIPT (VISIÓN GENERAL)?
+% ------------------------------------------------------------------------
+% Este archivo ejecuta un flujo completo de "modelado + simulación + análisis"
+% para dos sistemas físicos típicos:
+%
+%   A) FREEFALL (caída libre):
+%        y''(t) = -g
+%        Estados: posición y(t) y velocidad v(t)=y'(t)
+%
+%   B) SPRING (masa–resorte sin amortiguamiento):
+%        x''(t) + (k/m) x(t) = 0
+%        Estados: desplazamiento x(t) y velocidad v(t)=x'(t)
+%
+% El flujo tiene tres objetivos pedagógicos:
+%   (i)  VERIFICACIÓN:  ¿el método numérico (RK4) reproduce la solución exacta?
+%   (ii) VALIDACIÓN:    ¿el modelo (analítica) coincide con el sensor (medición)?
+%   (iii) DIAGNÓSTICO:  ¿domina el error numérico (solver) o el error de modelo/sensor?
+%
+% Para lograrlo, el script:
+%   1. Lee un archivo de datos (CSV/XLSX) con el tiempo t y una señal medida.
+%   2. Define el modelo diferencial y su solución analítica exacta.
+%   3. Integra numéricamente con RK4 clásico (k1–k4) en los puntos t del CSV.
+%      (Opcional: también puede correr ODE45, solo como comparación.)
+%   4. Calcula métricas de error: RMSE, MAE, MAX.
+%   5. Aplica criterios/umbrales de la guía para clasificar resultados.
+%   6. Dibuja gráficos de señales, errores y validación.
+%
+% ========================================================================
+% 2) ¿CÓMO USARLO?
+% ------------------------------------------------------------------------
+%  - Coloque este archivo .m y los CSV en la MISMA carpeta.
+%  - Edite solo el bloque "CONFIGURACIÓN".
+%  - Ejecute el script (Run).
+%
+% ========================================================================
+% 3) GLOSARIO DE VARIABLES (LAS MÁS IMPORTANTES)
+% ------------------------------------------------------------------------
+%  dataFile    : nombre del archivo de medición (CSV/XLSX).
+%  MODEL       : "FREEFALL" o "SPRING".
+%  SOLVER      : "RK4_FIXED" (RK4 clásico) u "ODE45" (comparación).
+%
+%  t           : vector de tiempos [s], estrictamente creciente (N×1).
+%  dt_med      : paso de tiempo típico (mediana de diff(t)).
+%  y_meas      : señal medida por sensor (posición) [m] (N×1), si existe.
+%  measName    : nombre de la columna de medición detectada en el archivo.
+%
+%  z           : estado del sistema (siempre 2 componentes):
+%               z(1)=posición (y o x) [m], z(2)=velocidad v [m/s].
+%  z0          : condición inicial del estado (2×1).
+%  f(t,z)      : función del modelo dinámico: devuelve z' (derivadas) (2×1).
+%  z_ana       : solución analítica exacta evaluada en t (N×2).
+%  z_num       : solución numérica evaluada en t (N×2).
+%
+%  stateLabel  : etiquetas para gráficas y tablas (posición y velocidad).
+%  measTarget  : índice del estado que corresponde a la medición (1=posición).
+%  omega_nat   : frecuencia natural ω=sqrt(k/m) (solo SPRING), si aplica.
+%
+%  metricas()  : función que calcula RMSE, MAE, MAX entre dos series.
+%
+% ========================================================================
+% NOTA IMPORTANTE (COHERENCIA 100% CON “RK4”)
+% ------------------------------------------------------------------------
+% Por defecto se usa RK4 CLÁSICO (k1-k4) con paso fijo en los puntos t.
+% ODE45 se deja como opción didáctica, pero NO es RK4 clásico: internamente
+% usa Dormand–Prince 4(5) con paso adaptativo.
+%
+% REQUIERE: MATLAB R2019b+ (tiledlayout, nexttile, yline)
+% =========================================================================
+
+clear; clc; close all;          % Limpia: variables (clear), consola (clc) y figuras (close all)
+
+%% CONFIGURACIÓN — EDITE SOLO ESTAS LÍNEAS
+dataFile = "datos_lab2_spring.csv";   % Archivo con datos: tiempo + medición (posición)
+MODEL    = "SPRING";                 % Modelo físico: "FREEFALL" o "SPRING"
+SOLVER   = "RK4_FIXED";              % Solver: "RK4_FIXED" (clásico) u "ODE45" (comparación)
+
+%% 1) DATOS (LECTURA DEL SENSOR)
+% Leemos el tiempo t y, si existe, una columna de posición medida (sensor).
+[t, y_meas, measName] = cargar_datos(dataFile);      % t: tiempo; y_meas: señal medida; measName: etiqueta de columna
+dt_med = median(diff(t));                            % Paso típico (robusto a valores atípicos)
+fprintf("Datos: %d pts | t=[%.3f, %.3f] s | dt_med=%.4g s\n", ... % Mensaje resumen
+    numel(t), t(1), t(end), dt_med);                 % numel(t)=N puntos, t(1)=inicio, t(end)=fin
+
+%% 2) MODELO + SOLUCIÓN ANALÍTICA (REFERENCIA “EXACTA”)
+% Aquí definimos:
+%   - la EDO (f),
+%   - las condiciones iniciales (z0),
+%   - la solución exacta (z_ana) para verificación,
+%   - etiquetas de variables (stateLabel),
+%   - índice de variable medida (measTarget),
+%   - frecuencia natural (omega_nat, solo SPRING).
+[f, z0, z_ana, stateLabel, measTarget, omega_nat] = configurar_modelo(MODEL, t);
+
+%% 3) INTEGRACIÓN NUMÉRICA (SELECCIÓN DEL SOLVER)
+% Objetivo: obtener z_num(t) integrando la EDO en la malla temporal t.
+switch upper(SOLVER)                                 % upper(): compara sin importar mayúsculas/minúsculas
+    case "ODE45"
+        % ODE45: método adaptativo Dormand–Prince 4(5). Útil como referencia “muy precisa”.
+        opts = odeset("RelTol", 1e-8, "AbsTol", 1e-10);        % Tolerancias: controlan el error local del integrador
+        [~, z_num] = ode45(f, t, z0, opts); %#ok<ASGLU>        % Integra en los instantes t; ignora salida del tiempo (~)
+        metodo  = "ode45 (Dormand–Prince 4/5)";               % Etiqueta para tablas y gráficas
+        p_orden = 4;                                          % Orden teórico usado para la “mejora esperada” al reducir dt
+
+    case "RK4_FIXED"
+        % RK4 clásico: paso fijo, 4º orden. Coherente 100% con “RK4” teórico.
+        z_num   = rk4_solve(f, t, z0);                        % Integra usando k1-k4, con h=t(i+1)-t(i)
+        metodo  = "RK4 clásico (paso fijo)";                  % Etiqueta para tablas y gráficas
+        p_orden = 4;                                          % Orden del método RK4
+
+    otherwise
+        error("SOLVER '%s' no reconocido. Opciones: RK4_FIXED | ODE45", SOLVER); % Mensaje de error claro
+end
+
+%% 4) MÉTRICAS + CLASIFICACIÓN (VERIFICACIÓN / VALIDACIÓN / DOMINANCIA)
+% Esta sección imprime:
+%  - tabla de verificación (método vs analítica) para posición y velocidad,
+%  - métricas de validación (sensor vs modelo),
+%  - ratio_mv (error de modelo vs error numérico),
+%  - etiquetas [OK]/[!]/[!!] según la guía del laboratorio.
+imprimir_metricas_y_criterios(metodo, p_orden, MODEL, dt_med, ... % Pasa etiquetas y parámetros del experimento
+    z_num, z_ana, stateLabel, y_meas, measName, measTarget);      % Pasa señales numéricas, analíticas y de sensor
+
+%% 5) GRÁFICAS (INTERPRETACIÓN VISUAL)
+% Se generan paneles para:
+%  - señal posición y velocidad (analítica vs numérica y sensor),
+%  - error absoluto del método,
+%  - validación (sensor vs modelo y vs método),
+%  - (SPRING) envolvente de amplitud para evidenciar amortiguamiento real.
+graficar(metodo, MODEL, t, z_ana, z_num, y_meas, ...     % Variables principales para graficar
+         stateLabel, measName, measTarget, omega_nat);   % Etiquetas y frecuencia natural (SPRING)
+
+% =========================================================================
+%% FUNCIONES LOCALES (SE DEFINEN ABAJO PARA QUE EL SCRIPT SEA AUTÓNOMO)
+% =========================================================================
+
+function [t, y_meas, measName] = cargar_datos(archivo)
+% -------------------------------------------------------------------------
+% FUNCIÓN: cargar_datos
+% -------------------------------------------------------------------------
+% OBJETIVO:
+%   Leer un archivo (CSV o XLSX) y extraer:
+%     - t      : tiempo [s] (vector columna, creciente)
+%     - y_meas : señal medida (posición) [m], si existe
+%     - measName: nombre de la columna de la medición detectada
+%
+% ENTRADA:
+%   archivo (string) : nombre/ruta del archivo
+%
+% SALIDAS:
+%   t (N×1)          : tiempo
+%   y_meas (N×1)     : medición (puede venir vacío [])
+%   measName (string): etiqueta de la medición
+% -------------------------------------------------------------------------
+
+    T       = readtable(archivo, VariableNamingRule="preserve"); % Lee archivo a una tabla (columnas con nombres)
+    nombres = T.Properties.VariableNames;                        % Obtiene nombres de columnas (headers)
+
+    idx_t = find(strcmpi(nombres, "t"), 1);                      % Busca columna llamada "t" (ignorando mayúsculas)
+    if isempty(idx_t), idx_t = 1; end                            % Si no existe, asume que la columna 1 es el tiempo
+    t = T{:, idx_t}(:);                                          % Extrae columna idx_t y fuerza vector columna
+
+    % --- Validaciones mínimas de integridad del tiempo --------------------
+    assert(isnumeric(t) && isvector(t) && ~isempty(t), ...       % Confirma que t sea numérico y no esté vacío
+        "cargar_datos: t debe ser un vector numérico no vacío.");
+    assert(all(isfinite(t)) && all(diff(t) > 0), ...             % Confirma que no haya NaN/Inf y que sea creciente
+        "cargar_datos: t debe ser finito y estrictamente creciente.");
+
+    y_meas   = [];                                               % Inicializa: si no se encuentra medición queda vacío
+    measName = "";                                               % Inicializa: etiqueta vacía por defecto
+
+    % --- Intenta encontrar una columna típica de posición -----------------
+    for nm = ["y","x","pos","position","desplazamiento"]          % Lista de nombres comunes en archivos reales
+        idx = find(strcmpi(nombres, nm), 1);                     % Busca coincidencia (case-insensitive)
+        if ~isempty(idx)                                         % Si encontró una columna válida...
+            y_meas   = T{:, idx}(:);                              % ... extrae esa columna como medición
+            measName = nm;                                       % ... guarda el nombre detectado
+            return                                               % ... y termina la función inmediatamente
+        end
+    end
+
+    % --- Fallback: si no hay nombre reconocido, usa la segunda columna ----
+    if width(T) >= 2                                              % width(T)=número de columnas
+        y_meas   = T{:, 2}(:);                                    % Asume columna 2 como medición
+        measName = "col2";                                        % Etiqueta genérica
+    end
+end
+
+% -------------------------------------------------------------------------
+function [f, z0, z_ana, stateLabel, measTarget, omega_nat] = configurar_modelo(MODEL, t)
+% -------------------------------------------------------------------------
+% FUNCIÓN: configurar_modelo
+% -------------------------------------------------------------------------
+% OBJETIVO:
+%   Definir la dinámica del sistema y la solución analítica exacta.
+%   Se usa la forma estándar de estado:
+%       z = [posición; velocidad]
+%       z' = f(t,z)
+%
+% ENTRADA:
+%   MODEL (string): "FREEFALL" o "SPRING"
+%   t (N×1)       : vector de tiempos donde se evalúa la analítica
+%
+% SALIDAS:
+%   f          : función anónima f(t,z) que devuelve z' (2×1)
+%   z0         : condición inicial (2×1)
+%   z_ana      : solución analítica exacta en t (N×2)
+%   stateLabel : etiquetas de estado para tablas/gráficas
+%   measTarget : índice del estado medido por el sensor (1=posición)
+%   omega_nat  : ω natural (solo SPRING); NaN si no aplica
+% -------------------------------------------------------------------------
+
+    switch upper(MODEL)                                           % Selecciona modelo sin sensibilidad a mayúsculas
+
+        case "FREEFALL"
+            % --- Parámetros físicos --------------------------------------
+            g  = 9.81;                                            % g: gravedad [m/s^2]
+            y0 = 0;                                               % y0: posición inicial [m]
+            v0 = 0;                                               % v0: velocidad inicial [m/s]
+
+            % --- Modelo diferencial --------------------------------------
+            % y' = v
+            % v' = -g
+            f  = @(~, z) [z(2); -g];                               % f devuelve vector columna 2×1
+
+            % --- Condición inicial ---------------------------------------
+            z0 = [y0; v0];                                        % z0(1)=y0, z0(2)=v0
+
+            % --- Solución analítica exacta -------------------------------
+            % y(t) = y0 + v0*t - 1/2*g*t^2
+            % v(t) = v0 - g*t
+            z_ana = [y0 + v0.*t - 0.5.*g.*t.^2,  v0 - g.*t];       % N×2: [posición, velocidad]
+
+            % --- Etiquetas y configuración -------------------------------
+            stateLabel = ["y [m]", "v [m/s]"];                     % Texto para ejes/tablas
+            measTarget = 1;                                       % El sensor mide posición (estado 1)
+            omega_nat  = NaN;                                     % No aplica para caída libre
+
+        case "SPRING"
+            % --- Parámetros físicos --------------------------------------
+            m  = 1.0;                                             % m: masa [kg]
+            k  = 25.0;                                            % k: constante del resorte [N/m]
+            x0 = 0.10;                                            % x0: desplazamiento inicial [m]
+            v0 = 0;                                               % v0: velocidad inicial [m/s]
+
+            % --- Frecuencia natural --------------------------------------
+            w  = sqrt(k / m);                                     % ω = sqrt(k/m) [rad/s]
+
+            % --- Modelo diferencial --------------------------------------
+            % x' = v
+            % v' = -(k/m) x
+            f  = @(~, z) [z(2); -(k/m) .* z(1)];                   % f devuelve vector columna 2×1
+
+            % --- Condición inicial ---------------------------------------
+            z0 = [x0; v0];                                        % z0(1)=x0, z0(2)=v0
+
+            % --- Solución analítica exacta (sin amortiguamiento) ----------
+            % x(t) = x0*cos(ωt) + (v0/ω)*sin(ωt)
+            % v(t) = -x0*ω*sin(ωt) + v0*cos(ωt)
+            z_ana = [x0.*cos(w.*t) + (v0/w).*sin(w.*t), ...        % Columna 1: posición
+                     -x0.*w.*sin(w.*t) + v0.*cos(w.*t)];           % Columna 2: velocidad
+
+            % --- Etiquetas y configuración -------------------------------
+            stateLabel = ["x [m]", "v [m/s]"];                     % Texto para ejes/tablas
+            measTarget = 1;                                       % El sensor mide desplazamiento (estado 1)
+            omega_nat  = w;                                       % ω natural para análisis de amplitud
+
+        otherwise
+            error("Modelo '%s' no reconocido. Opciones: FREEFALL | SPRING", MODEL); % Mensaje de error claro
+    end
+end
+
+% -------------------------------------------------------------------------
+function M = metricas(a, b)
+% -------------------------------------------------------------------------
+% FUNCIÓN: metricas
+% -------------------------------------------------------------------------
+% OBJETIVO:
+%   Calcular tres métricas estándar entre dos señales:
+%     RMSE = sqrt(mean((a-b)^2))
+%     MAE  = mean(|a-b|)
+%     MAX  = max(|a-b|)
+%
+% ENTRADAS:
+%   a, b : vectores (misma longitud). Se comparan elemento a elemento.
+%
+% SALIDA:
+%   M : estructura con campos M.RMSE, M.MAE, M.MAX
+% -------------------------------------------------------------------------
+
+    r = a(:) - b(:);                                              % Residuo (error) vector columna
+    M.RMSE = sqrt(mean(r.^2));                                    % Raíz del error cuadrático medio
+    M.MAE  = mean(abs(r));                                        % Error absoluto medio
+    M.MAX  = max(abs(r));                                         % Error absoluto máximo
+end
+
+% -------------------------------------------------------------------------
+function z = rk4_solve(f, t, z0)
+% -------------------------------------------------------------------------
+% FUNCIÓN: rk4_solve (RK4 CLÁSICO)
+% -------------------------------------------------------------------------
+% OBJETIVO:
+%   Integrar z' = f(t,z) usando Runge–Kutta de 4º orden (k1..k4).
+%
+% TEORÍA (un paso):
+%   k1 = f(tn,        zn)
+%   k2 = f(tn + h/2,  zn + h/2*k1)
+%   k3 = f(tn + h/2,  zn + h/2*k2)
+%   k4 = f(tn + h,    zn + h*k3)
+%   zn+1 = zn + (h/6)*(k1 + 2k2 + 2k3 + k4)
+%
+% ENTRADAS:
+%   f  : función del modelo (debe devolver vector columna)
+%   t  : vector de tiempos (N×1). h se calcula como t(i+1)-t(i)
+%   z0 : condición inicial (2×1)
+%
+% SALIDA:
+%   z  : matriz (N×2) con el estado numérico en cada tiempo de t
+% -------------------------------------------------------------------------
+
+    N = numel(t);                                                 % N: número de puntos de tiempo
+    p = numel(z0);                                                % p: dimensión del estado (aquí p=2)
+    z = zeros(N, p);                                              % Pre-asignación para eficiencia (evita crecimiento dinámico)
+    z(1,:) = z0(:).';                                             % Guarda condición inicial en la primera fila (transpuesta a fila)
+
+    for i = 1:N-1                                                 % Recorre cada intervalo [t(i), t(i+1)]
+        h  = t(i+1) - t(i);                                       % h: tamaño de paso del intervalo i
+        ti = t(i);                                                % ti: tiempo actual
+        zi = z(i,:).';                                            % zi: estado actual como vector columna (p×1)
+
+        k1 = f(ti,        zi);                                    % k1: pendiente al inicio del intervalo
+        k2 = f(ti + h/2,  zi + (h/2).*k1);                        % k2: pendiente en el punto medio usando k1
+        k3 = f(ti + h/2,  zi + (h/2).*k2);                        % k3: pendiente en el punto medio usando k2
+        k4 = f(ti + h,    zi + h.*k3);                            % k4: pendiente al final del intervalo usando k3
+
+        z(i+1,:) = (zi + (h/6).*(k1 + 2.*k2 + 2.*k3 + k4)).';     % Actualiza al siguiente estado y guarda como fila
+    end
+end
+
+% -------------------------------------------------------------------------
+function imprimir_metricas_y_criterios(metodo, p_orden, MODEL, dt, ...
+    z_num, z_ana, stateLabel, y_meas, measName, measTarget)
+% -------------------------------------------------------------------------
+% FUNCIÓN: imprimir_metricas_y_criterios
+% -------------------------------------------------------------------------
+% OBJETIVO:
+%   Imprimir en consola:
+%     (1) VERIFICACIÓN: método vs analítica (posición y velocidad)
+%     (2) VALIDACIÓN: sensor vs modelo (si hay medición)
+%     (3) ratio_pv = RMSE(vel) / RMSE(pos)
+%     (4) ratio_mv = RMSE(sensor vs modelo) / RMSE(método vs analítica)
+%         (CORREGIDO: se calcula sobre la MISMA variable medida)
+%     (5) Clasificaciones [OK]/[!]/[!!] basadas en umbrales de la guía.
+%
+% ENTRADAS (en lenguaje de ingeniería):
+%   metodo     : texto del método usado (p.ej., "RK4 clásico")
+%   p_orden    : orden del método para estimar mejora al reducir dt
+%   MODEL      : modelo físico
+%   dt         : paso de tiempo típico (s)
+%   z_num      : solución numérica (N×2)
+%   z_ana      : solución analítica exacta (N×2)
+%   stateLabel : etiquetas de variables
+%   y_meas     : medición de sensor (N×1) o []
+%   measName   : nombre de la columna del sensor
+%   measTarget : índice del estado que se compara con el sensor (1=posición)
+% -------------------------------------------------------------------------
+
+    sep = repmat("-", 1, 74);                                     % Separador visual para consola
+
+    % ===================== VERIFICACIÓN ==================================
+    fprintf("\n%s\nVERIFICACIÓN (método numérico vs analítica) | %s | Modelo: %s\n%s\n", ...
+        sep, metodo, MODEL, sep);                                 % Encabezado de verificación
+
+    fprintf("  %-12s | %12s | %12s | %12s\n","Variable","RMSE","MAE","MAX"); % Cabecera de tabla
+    fprintf("%s\n", sep);                                         % Línea separadora
+
+    M = cell(1,2);                                                % M{1} para posición, M{2} para velocidad
+    for k = 1:2                                                   % k=1 (pos), k=2 (vel)
+        M{k} = metricas(z_num(:,k), z_ana(:,k));                  % Calcula métricas para la variable k
+        fprintf("  %-12s | %12.4e | %12.4e | %12.4e\n", ...
+            stateLabel(k), M{k}.RMSE, M{k}.MAE, M{k}.MAX);        % Imprime métricas en notación científica
+    end
+    fprintf("%s\n", sep);                                         % Cierra tabla
+
+    % --- Clasificación de verificación usando RMSE de POSICIÓN ------------
+    rmse_pos = M{1}.RMSE;                                         % RMSE de la posición (principal para el laboratorio)
+    if rmse_pos < 1e-4                                            % Umbral “muy bajo” (típico de RK4/ode45 en modelos suaves)
+        tagV = "[OK]  MUY BAJO";                                  % Etiqueta resumen
+        msgV = "Error numérico MUY BAJO (típico de RK4/ode45).";   % Interpretación
+    elseif rmse_pos < 1e-1                                        % Umbral moderado
+        tagV = "[!]   MODERADO";                                  % Etiqueta resumen
+        msgV = "Error numérico MODERADO. Considere reducir dt.";   % Interpretación
+    else
+        tagV = "[!!]  ALTO";                                      % Etiqueta resumen
+        msgV = "Error numérico ALTO (>= 0.1 en posición).";        % Interpretación
+    end
+
+    mejora_pct = (1 - (1/2)^p_orden) * 100;                       % Mejora esperada en error global al reducir dt a la mitad
+    fprintf("  %s  | RMSE(posición)=%.4g  -> %s\n", tagV, rmse_pos, msgV); % Reporta clasificación
+    if rmse_pos >= 1e-4                                           % Solo sugiere reducir dt si el error no es despreciable
+        fprintf("  Si reduce dt a dt/2, mejora esperada (orden p=%d): %.2f%%\n", p_orden, mejora_pct);
+    end
+
+    ratio_pv = M{2}.RMSE / max(M{1}.RMSE, 1e-15);                 % ratio_pv: compara escalas de error vel vs pos
+    fprintf("  ratio_pv = RMSE(vel)/RMSE(pos) = %.3g\n", ratio_pv);% Imprime ratio_pv
+
+    % ===================== VALIDACIÓN ====================================
+    if ~isempty(y_meas)                                           % Solo valida si existe medición en el archivo
+        fprintf("\n%s\nVALIDACIÓN (sensor vs modelo) | Sensor: '%s'\n%s\n", ...
+            sep, measName, sep);                                  % Encabezado de validación
+
+        mv    = metricas(y_meas, z_ana(:,measTarget));            % mv: sensor vs analítica (error de modelo + sensor)
+        mn    = metricas(y_meas, z_num(:,measTarget));            % mn: sensor vs numérico (incluye error numérico)
+        m_met = metricas(z_num(:,measTarget), z_ana(:,measTarget)); % m_met: método vs analítica en variable medida
+
+        fprintf("  %-34s | RMSE=%12.4e | MAE=%12.4e | MAX=%12.4e\n", ...
+            "Sensor vs Analítica (modelo)", mv.RMSE, mv.MAE, mv.MAX); % Imprime error sensor vs modelo
+        fprintf("  %-34s | RMSE=%12.4e | MAE=%12.4e | MAX=%12.4e\n", ...
+            "Sensor vs Numérico (método)", mn.RMSE, mn.MAE, mn.MAX);  % Imprime error sensor vs método
+
+        % --- Clasificación de validación según RMSE(sensor vs modelo) -----
+        if mv.RMSE < 0.01                                         % <1 cm: excelente
+            tagVal = "[OK]  EXCELENTE";
+            msgVal = "Excelente ajuste (RMSE < 1 cm).";
+        elseif mv.RMSE < 0.05                                     % 1–5 cm: buen ajuste
+            tagVal = "[OK]  BUEN AJUSTE";
+            msgVal = "Buen ajuste: discrepancia dentro del ruido esperado del sensor.";
+        elseif mv.RMSE < 0.15                                     % 5–15 cm: aceptable
+            tagVal = "[!]   ACEPTABLE";
+            msgVal = "Ajuste aceptable pero con discrepancia notable (posible física omitida).";
+        else                                                      % >15 cm: discrepancia significativa
+            tagVal = "[!!]  SIGNIFICATIVA";
+            msgVal = "Discrepancia significativa: el modelo no describe bien la física.";
+        end
+        fprintf("  %s  | RMSE(Sensor vs Modelo)=%.4g  -> %s\n", tagVal, mv.RMSE, msgVal);
+
+        % --- ratio_mv (CORREGIDO): compara error de modelo vs error numérico
+        % Definición guía:
+        %   ratio_mv = RMSE(Sensor vs Modelo) / RMSE(Método vs Analítica)
+        ratio_mv = mv.RMSE / max(m_met.RMSE, 1e-15);              % Si el método es muy preciso, el denominador será muy pequeño
+        fprintf("  ratio_mv = RMSE(Sensor vs Modelo) / RMSE(Método vs Analítica) = %.3g\n", ratio_mv);
+
+        % --- Criterio de dominancia: ¿qué error manda? --------------------
+        if ratio_mv > 100                                         % Muchísimo mayor: domina el modelo/sensor
+            tagR = "[!!]  DOMINA MODELO (ABSOLUTO)";
+            msgR = "Mejorar solver o reducir dt NO ayuda. Revise supuestos del modelo.";
+        elseif ratio_mv > 10                                      % Mayor: domina el modelo
+            tagR = "[!]   DOMINA MODELO";
+            msgR = "Mejorar solver tiene impacto marginal. Priorice mejorar el modelo.";
+        else                                                      % Similar: ambos aportan
+            tagR = "[i]   MISMO ORDEN";
+            msgR = "Ambas fuentes contribuyen: mejorar solver y/o modelo es útil.";
+        end
+        fprintf("  %s  -> %s\n", tagR, msgR);
+
+        if ratio_mv > 10 && dt > 0                                % Mensaje pedagógico adicional
+            fprintf("  Nota: con RK4/ode45, el error numérico suele ser despreciable; manda la física/medición.\n");
+        end
+    end
+
+    fprintf("%s\n", sep);                                         % Cierre del reporte
+end
+
+% -------------------------------------------------------------------------
+function graficar(metodo, MODEL, t, z_ana, z_num, y_meas, ...
+                  stateLabel, measName, measTarget, omega_nat)
+% -------------------------------------------------------------------------
+% FUNCIÓN: graficar
+% -------------------------------------------------------------------------
+% OBJETIVO:
+%   Construir una figura “pedagógica” con paneles:
+%     - Señales: analítica vs numérica (+ sensor si existe)
+%     - Errores absolutos del método
+%     - Validación (sensor vs modelo y sensor vs método)
+%     - (SPRING) envolvente de amplitud: evidencia amortiguamiento real
+% -------------------------------------------------------------------------
+
+    % Colores fijos (solo visualización; no afectan cálculos)
+    C_ana  = [0.12 0.47 0.71];                                    % Azul: analítica (exacta)
+    C_num  = [0.84 0.15 0.16];                                    % Rojo: numérica
+    C_meas = [0.17 0.63 0.17];                                    % Verde: sensor
+    C_bg   = [0.97 0.97 0.97];                                    % Fondo gris claro para mejorar lectura
+
+    N      = numel(t);                                            % Número de muestras
+    dt_med = median(diff(t));                                     % Paso típico para mensajes/ventanas
+    esSpring = strcmpi(MODEL,"SPRING") && ~isempty(y_meas) && isfinite(omega_nat); % ¿aplica análisis de amplitud?
+
+    rows = 2 + double(~isempty(y_meas)) + double(esSpring);       % Número de filas de paneles según si hay sensor y si es SPRING
+
+    figure("Name", sprintf("%s | %s", metodo, MODEL), ...         % Nombre de ventana de figura
+           "NumberTitle","off","Color","white", ...               % Sin numeración automática, fondo blanco
+           "Position",[50 30 1100 220+255*rows]);                 % Tamaño de figura (crece con número de filas)
+
+    tl = tiledlayout(rows, 2, "TileSpacing","compact","Padding","compact"); % Layout en rejilla (rows × 2)
+    title(tl, sprintf("%s  |  Modelo: %s  |  dt=%.4g s  |  N=%d", ...
+          metodo, MODEL, dt_med, N), "FontSize",12,"FontWeight","bold");    % Título general
+
+    % ---- Panel 1: Señal de posición -------------------------------------
+    ax1 = nexttile;                                               % Selecciona “tile” siguiente
+    set(ax1,"Color",C_bg); hold on; grid on; grid minor;          % Fondo, mantener trazos, grilla
+    plot(t, z_ana(:,1), "Color",C_ana,"LineWidth",2.5, "DisplayName","Analítica"); % Curva exacta
+    plot(t, z_num(:,1), "--","Color",C_num,"LineWidth",1.8, "DisplayName",metodo); % Curva numérica
+    if ~isempty(y_meas)                                           % Si hay sensor...
+        plot(t, y_meas, ":","Color",C_meas,"LineWidth",1.3, "DisplayName","Sensor: "+measName); % Curva sensor
+    end
+    xlabel("t [s]"); ylabel(stateLabel(1));                       % Etiquetas de ejes
+    title("Señal: "+stateLabel(1));                               % Título del panel
+    legend("Location","best","FontSize",9);                       % Leyenda
+
+    % ---- Panel 2: Señal de velocidad ------------------------------------
+    ax2 = nexttile;                                               % Panel siguiente
+    set(ax2,"Color",C_bg); hold on; grid on; grid minor;          % Estética
+    plot(t, z_ana(:,2), "Color",C_ana,"LineWidth",2.5, "DisplayName","Analítica"); % Velocidad exacta
+    plot(t, z_num(:,2), "--","Color",C_num,"LineWidth",1.8, "DisplayName",metodo); % Velocidad numérica
+    xlabel("t [s]"); ylabel(stateLabel(2));                       % Etiquetas
+    title("Señal: "+stateLabel(2));                               % Título
+    legend("Location","best","FontSize",9);                       % Leyenda
+
+    % ---- Panel 3: Error absoluto en posición ----------------------------
+    ax3 = nexttile;                                               % Panel siguiente
+    set(ax3,"Color",C_bg); hold on; grid on; grid minor;          % Estética
+    e1 = abs(z_num(:,1) - z_ana(:,1));                            % Error absoluto en posición (|num - exacta|)
+    m1 = metricas(z_num(:,1), z_ana(:,1));                        % Métricas del error de posición
+    fill([t; flipud(t)], [e1; zeros(N,1)], C_num, ...             % Área sombreada bajo el error
+         "FaceAlpha",0.15,"EdgeColor","none", "HandleVisibility","off");
+    plot(t, e1, "Color",C_num,"LineWidth",1.8,"DisplayName","|error|"); % Curva del error
+    yline(m1.RMSE,"--",sprintf("RMSE=%.3e",m1.RMSE), "Color",C_num,"FontSize",8, ...
+          "LabelHorizontalAlignment","right");                    % Línea horizontal en RMSE
+    yline(m1.MAX, ":",sprintf("MAX=%.3e",m1.MAX), "Color",[0.4 0 0],"FontSize",8, ...
+          "LabelHorizontalAlignment","right");                    % Línea horizontal en MAX
+    xlabel("t [s]"); ylabel("|e|  "+stateLabel(1));               % Etiquetas
+    title("Error: "+stateLabel(1));                               % Título
+    legend("Location","northwest","FontSize",9);                  % Leyenda
+
+    % ---- Panel 4: Error absoluto en velocidad ---------------------------
+    ax4 = nexttile;                                               % Panel siguiente
+    set(ax4,"Color",C_bg); hold on; grid on; grid minor;          % Estética
+    e2 = abs(z_num(:,2) - z_ana(:,2));                            % Error absoluto en velocidad
+    m2 = metricas(z_num(:,2), z_ana(:,2));                        % Métricas del error de velocidad
+    fill([t; flipud(t)], [e2; zeros(N,1)], C_num, "FaceAlpha",0.15,"EdgeColor","none", ...
+         "HandleVisibility","off");                               % Área sombreada
+    plot(t, e2, "Color",C_num,"LineWidth",1.8,"DisplayName","|error|"); % Curva del error
+    yline(m2.RMSE,"--",sprintf("RMSE=%.3e",m2.RMSE), "Color",C_num,"FontSize",8, ...
+          "LabelHorizontalAlignment","right");                    % RMSE
+    xlabel("t [s]"); ylabel("|e|  "+stateLabel(2));               % Etiquetas
+    title("Error: "+stateLabel(2));                               % Título
+    legend("Location","northwest","FontSize",9);                  % Leyenda
+
+    linkaxes([ax1 ax2 ax3 ax4], "x");                             % Sincroniza zoom/desplazamiento en eje x para todos los paneles
+
+    % ---- Panel 5: Validación (si hay sensor) ----------------------------
+    if ~isempty(y_meas)                                           % Solo si existe medición
+        ax5 = nexttile([1 2]);                                    % Panel ocupando dos columnas
+        set(ax5,"Color",C_bg); hold on; grid on; grid minor;      % Estética
+        ev = abs(y_meas - z_ana(:,measTarget));                   % Error sensor vs modelo (analítica)
+        en = abs(y_meas - z_num(:,measTarget));                   % Error sensor vs numérico
+        mv = metricas(y_meas, z_ana(:,measTarget));               % Métricas sensor vs modelo
+        mn = metricas(y_meas, z_num(:,measTarget));               % Métricas sensor vs numérico
+
+        fill([t; flipud(t)], [ev; zeros(N,1)], C_meas, "FaceAlpha",0.15,"EdgeColor","none", ...
+             "HandleVisibility","off");                           % Área error modelo
+        fill([t; flipud(t)], [en; zeros(N,1)], C_num, "FaceAlpha",0.12,"EdgeColor","none", ...
+             "HandleVisibility","off");                           % Área error numérico
+
+        plot(t, ev, "Color",C_meas,"LineWidth",2.0, ...
+             "DisplayName",sprintf("Sensor vs Modelo (RMSE=%.3e)", mv.RMSE)); % Curva validación (modelo)
+        plot(t, en, "--","Color",C_num,"LineWidth",1.5, ...
+             "DisplayName",sprintf("Sensor vs %s (RMSE=%.3e)", metodo, mn.RMSE)); % Curva validación (método)
+
+        xlabel("t [s]");                                          % Eje x
+        ylabel("|e|  ["+stateLabel(measTarget)+"]");              % Eje y (error absoluto)
+        title("VALIDACIÓN — si el método es preciso, domina el error de modelo/sensor"); % Mensaje pedagógico
+        legend("Location","best","FontSize",9);                   % Leyenda
+    end
+
+    % ---- Panel 6: Amplitud (SPRING + sensor) ----------------------------
+    if esSpring                                                   % Solo si: modelo SPRING, hay sensor y omega_nat es válido
+        ax6 = nexttile([1 2]);                                    % Panel ocupando dos columnas
+        set(ax6,"Color",C_bg); hold on; grid on; grid minor;      % Estética
+
+        T_per = 2*pi / omega_nat;                                 % Periodo teórico del oscilador [s]
+        win   = max(3, round(T_per / dt_med));                    % Tamaño de ventana ~1 periodo (en muestras)
+
+        amp_modelo = movmax(abs(z_ana(:,1)), win);                % Envolvente aproximada del modelo (sin amortiguamiento)
+        amp_sensor = movmax(abs(y_meas),     win);                % Envolvente aproximada del sensor (puede decaer si hay amortiguamiento real)
+
+        plot(t, amp_modelo, "Color",C_ana, "LineWidth",2.5, ...
+             "DisplayName","Envolvente modelo (sin amort.)");     % Curva de amplitud modelo
+        plot(t, amp_sensor, "--","Color",C_meas, "LineWidth",2.0, ...
+             "DisplayName","Envolvente sensor (¿amort. real?)");  % Curva de amplitud sensor
+
+        xlabel("t [s]"); ylabel("Amplitud máx. local [m]");       % Etiquetas
+        title("SPRING — Si la envolvente del sensor decae, el modelo omite amortiguamiento"); % Interpretación física
+        legend("Location","northeast","FontSize",9);              % Leyenda
+    end
+end
